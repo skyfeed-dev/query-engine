@@ -293,7 +293,7 @@ async fn generate_feed_skeleton(
                         posts.retain(|p| p.image_count < 2);
                     }
                 } else if subject == "like_count" {
-                    let value: i32 = filter["value"].as_i64().unwrap().try_into()?;
+                    let value: u32 = filter["value"].as_i64().unwrap().try_into()?;
 
                     let operator = if filter.contains_key("operator") {
                         filter["operator"].as_str().unwrap_or("<")
@@ -521,7 +521,7 @@ async fn run_query(query: &str, mutex: &RwLock<ServerConfig>) -> Result<(), reqw
         let new_post = Post::new(
             id.clone(),
             post["text"].as_str().unwrap().to_string(),
-            author.clone(),
+            // author.clone(),
             lang,
             DateTime::parse_from_rfc3339(post["createdAt"].as_str().unwrap())
                 .unwrap()
@@ -659,10 +659,10 @@ fn ensure_valid_rkey(rkey: &str) -> anyhow::Result<()> {
 struct Post {
     id: String,
     text: String,
-    author: String,
+    // author: String,
     created_at: DateTime<Utc>,
-    like_count: i32,
-    image_count: i32,
+    like_count: u32,
+    image_count: u32,
     is_reply: bool,
     is_hellthread: bool,
     lang: String,
@@ -677,11 +677,11 @@ impl Post {
     fn new(
         id: String,
         text: String,
-        author: String,
+        // author: String,
         lang: String,
         created_at: DateTime<Utc>,
-        mut like_count: i32,
-        image_count: i32,
+        like_count: u32,
+        image_count: u32,
         is_reply: bool,
         is_hellthread: bool,
     ) -> Post {
@@ -700,7 +700,7 @@ impl Post {
         Post {
             id,
             text,
-            author,
+            // author,
             lang,
             created_at,
             like_count,
