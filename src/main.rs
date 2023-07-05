@@ -371,37 +371,25 @@ async fn generate_feed_skeleton(
                     posts.sort_by(|b, a| a.created_at.cmp(&b.created_at));
                 }
             } else if sort_type == "hn" {
-                let gravity = if block.contains_key("gravity") {
+                let gravity_str = if block.contains_key("gravity") {
                     block["gravity"].as_str().unwrap_or("1.8")
                 } else {
                     "1.8"
                 };
 
-                if gravity == "4.0" {
-                    if direction == "asc" {
-                        posts.sort_by(|a, b| a.score_4_0.partial_cmp(&b.score_4_0).unwrap());
-                    } else {
-                        posts.sort_by(|b, a| a.score_4_0.partial_cmp(&b.score_4_0).unwrap());
-                    }
-                } else if gravity == "1.2" {
-                    if direction == "asc" {
-                        posts.sort_by(|a, b| a.score_1_2.partial_cmp(&b.score_1_2).unwrap());
-                    } else {
-                        posts.sort_by(|b, a| a.score_1_2.partial_cmp(&b.score_1_2).unwrap());
-                    }
-                } else if gravity == "2.2" {
-                    if direction == "asc" {
-                        posts.sort_by(|a, b| a.score_2_2.partial_cmp(&b.score_2_2).unwrap());
-                    } else {
-                        posts.sort_by(|b, a| a.score_2_2.partial_cmp(&b.score_2_2).unwrap());
-                    }
+                let gravity = gravity_str.parse::<f64>()?;
+
+                let mut tuples: Vec<(f64, &Post)> = posts
+                    .into_iter()
+                    .map(|p| (p.calculate_score(gravity), p))
+                    .collect();
+
+                if direction == "asc" {
+                    tuples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 } else {
-                    if direction == "asc" {
-                        posts.sort_by(|a, b| a.score_1_8.partial_cmp(&b.score_1_8).unwrap());
-                    } else {
-                        posts.sort_by(|b, a| a.score_1_8.partial_cmp(&b.score_1_8).unwrap());
-                    }
+                    tuples.sort_by(|b, a| a.0.partial_cmp(&b.0).unwrap());
                 }
+                posts = tuples.into_iter().map(|t| t.1).collect();
             } else if sort_type == "likes" {
                 if direction == "asc" {
                     posts.sort_by(|a, b| a.like_count.cmp(&b.like_count));
@@ -662,10 +650,6 @@ struct Post {
     is_hellthread: bool,
     lang: String,
     // langs: Vec<String>,
-    score_1_2: f64,
-    score_1_8: f64,
-    score_2_2: f64,
-    score_4_0: f64,
 }
 
 impl Post {
@@ -680,18 +664,6 @@ impl Post {
         is_reply: bool,
         is_hellthread: bool,
     ) -> Post {
-        let diff_hours = Utc::now()
-            .signed_duration_since(created_at)
-            .num_minutes()
-            .abs() as f64
-            / 60.0
-            + 2.0;
-
-        let score_1_8 = like_count as f64 / diff_hours.powf(1.8);
-        let score_2_2 = like_count as f64 / diff_hours.powf(2.2);
-        let score_4_0 = like_count as f64 / diff_hours.powf(4.0);
-        let score_1_2 = like_count as f64 / diff_hours.powf(1.2);
-
         Post {
             id,
             text,
@@ -702,10 +674,17 @@ impl Post {
             image_count,
             is_reply,
             is_hellthread,
-            score_1_2,
-            score_1_8,
-            score_2_2,
-            score_4_0,
         }
+    }
+
+    fn calculate_score(&self, gravity: f64) -> f64 {
+        let diff_hours = Utc::now()
+            .signed_duration_since(self.created_at)
+            .num_minutes()
+            .abs() as f64
+            / 60.0
+            + 2.0;
+
+        self.like_count as f64 / diff_hours.powf(gravity)
     }
 }
