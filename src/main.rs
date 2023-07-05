@@ -182,12 +182,7 @@ async fn generate_feed_skeleton(
                     .checked_sub_signed(chrono::Duration::seconds(seconds))
                     .unwrap();
 
-                posts.extend(
-                    sc.all_posts
-                        .values()
-                        .into_iter()
-                        .filter(|p| p.created_at > cutoff),
-                );
+                posts.extend(sc.all_posts.values().filter(|p| p.created_at > cutoff));
             } else if input_type == "list" {
                 let list_id = at_uri_to_post_id(block["listUri"].as_str().unwrap())?;
 
@@ -436,7 +431,7 @@ async fn generate_feed_skeleton(
     debug.time = query_start.elapsed().as_millis();
 
     let res = FeedBuilderResponse {
-        debug: debug,
+        debug,
         feed: posts
             .iter()
             .map(|p| {
