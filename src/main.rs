@@ -581,7 +581,7 @@ async fn run_like_count_query(
 }
 
 lazy_static::lazy_static! {
-    static ref VALID_DID_KEY_REGEX: Regex = Regex::new(r"^(plc|web)_[a-z0-9\_]+$").unwrap();
+    static ref VALID_DID_KEY_REGEX: Regex = Regex::new(r"^(plc|web)_[a-z0-9_]+$").unwrap();
 }
 
 fn convert_post_id_to_uri(id: &str) -> String {
