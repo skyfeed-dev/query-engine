@@ -47,6 +47,7 @@ fn get_surreal_auth_header() -> String {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().unwrap();
+    println!("SurrealDB API URL: {}", env::var("SURREAL_URL_SQL").unwrap());
 
     let server_config = ServerConfig {
         all_posts: HashMap::new(),
@@ -57,31 +58,57 @@ async fn main() {
 
     println!("init");
 
-    // ! prod
-    run_query("SELECT id,text,author,langs,createdAt,count(images) as imageCount,root,count(<-like) as likeCount FROM post;", &arc).await.unwrap();
-
-    // ! dev
-    // run_query("SELECT id,text,author,langs,createdAt,count(images) as imageCount,root,count(<-like) as likeCount FROM post WHERE createdAt > (time::now() - 24h);", &mutex).await.unwrap();
+    // ! 168h = 1 week
+    run_query(
+        "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 168h);", 
+        &arc,
+        Duration::from_secs(60 * 30)
+    ).await.unwrap();
 
     println!("ready!");
 
     let new_posts_task_arc = Arc::clone(&arc);
     let _new_posts_task = task::spawn(async move {
+        let query = "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 3000s);";
+        let res = run_query(query, &new_posts_task_arc, Duration::from_secs(100)).await;
+        if res.is_err() {
+            println!("ERROR run_query {}", res.unwrap_err());
+        }
+
         let mut interval = time::interval(Duration::from_secs(100));
         loop {
             interval.tick().await;
-            let query = "SELECT id,text,author,langs,createdAt,count(images) as imageCount,root,count(<-like) as likeCount FROM post WHERE createdAt > (time::now() - 300s);";
-            run_query(query, &new_posts_task_arc).await.unwrap_or(());
+            let query = "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 300s);";
+            let res = run_query(query, &new_posts_task_arc, Duration::from_secs(100)).await;
+            if res.is_err() {
+                println!("ERROR run_query {}", res.unwrap_err());
+            }
         }
     });
 
     // every 5 mins
     let like_count_task_arc = Arc::clone(&arc);
     let _like_count_task = task::spawn(async move {
+        time::sleep(Duration::from_secs(30)).await;
+
         let mut interval = time::interval(Duration::from_secs(60 * 5));
         loop {
             interval.tick().await;
-            run_like_count_query("12h", &like_count_task_arc)
+            run_update_counts_query("12h", &like_count_task_arc)
+                .await
+                .unwrap_or(());
+        }
+    });
+    // every 60 mins
+    let like_count_task_arc_2 = Arc::clone(&arc);
+    let _like_count_task_2 = task::spawn(async move {
+        let period = Duration::from_secs(60 * 60);
+        time::sleep(period).await;
+
+        let mut interval = time::interval(period);
+        loop {
+            interval.tick().await;
+            run_update_counts_query("72h", &like_count_task_arc_2)
                 .await
                 .unwrap_or(());
         }
@@ -126,6 +153,7 @@ async fn generate_feed_skeleton_route(
                     debug: FeedBuilderResponseDebug {
                         time: 0,
                         timing: HashMap::new(),
+                        counts: HashMap::new(),
                     },
                     feed: vec![PostReference {
                         post: format!("Error: {}", e,),
@@ -138,7 +166,7 @@ async fn generate_feed_skeleton_route(
     response.unwrap_or_else(|(status, body)| (status, body))
 }
 
-static LISTITEM_QUERY: &str = "RETURN (SELECT out FROM listitem WHERE in = LIST_ID).out;";
+static LISTITEM_QUERY: &str = "RETURN (SELECT ->listitem.out as dids FROM LIST_ID).dids;";
 
 async fn generate_feed_skeleton(
     state: Arc<RwLock<ServerConfig>>,
@@ -153,11 +181,14 @@ async fn generate_feed_skeleton(
 
     let mut posts: Vec<&Post> = vec![];
 
+    let mut stash: HashMap<&str, Vec<&Post>> = HashMap::new();
+
     let filter_types = vec!["remove", "regex"];
 
     let mut debug = FeedBuilderResponseDebug {
         time: 0,
         timing: HashMap::new(),
+        counts: HashMap::new(),
     };
 
     let sc = state.read().await;
@@ -184,30 +215,23 @@ async fn generate_feed_skeleton(
 
                 posts.extend(sc.all_posts.values().filter(|p| p.created_at > cutoff));
             } else if input_type == "list" {
-                let list_id = at_uri_to_post_id(block["listUri"].as_str().unwrap())?;
+                let dids = fetch_list(block["listUri"].as_str().unwrap()).await?;
 
-                let client = Client::new();
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert("accept", "application/json".parse()?);
-                headers.insert("NS", "atproto".parse()?);
-                headers.insert("DB", "bsky".parse()?);
-                headers.insert("Authorization", get_surreal_auth_header().parse()?);
+                let seconds = if block.contains_key("historySeconds") {
+                    block["historySeconds"].as_i64().unwrap_or(604800)
+                } else {
+                    604800
+                };
+                let cutoff = Utc::now()
+                    .checked_sub_signed(chrono::Duration::seconds(seconds))
+                    .unwrap();
 
-                let request_builder = client
-                    .post(get_surreal_api_url())
-                    .headers(headers)
-                    .body(LISTITEM_QUERY.replace("LIST_ID", &list_id));
-
-                let res = request_builder.send().await?;
-
-                let list: Vec<Value> = res.json().await?;
-
-                let list2 = list.last().unwrap()["result"].as_array().unwrap();
-
-                for did in list2 {
-                    let did = did.as_str().unwrap();
-                    for id in sc.all_posts_by_author.get(did).unwrap_or(&HashSet::new()) {
-                        posts.push(sc.all_posts.get(id).unwrap());
+                for did in dids {
+                    for id in sc.all_posts_by_author.get(&did).unwrap_or(&HashSet::new()) {
+                        let post = sc.all_posts.get(id).unwrap();
+                        if post.created_at > cutoff {
+                            posts.push(post);
+                        }
                     }
                 }
             } else if input_type == "feed" {
@@ -287,6 +311,42 @@ async fn generate_feed_skeleton(
                     } else if value == "2+" {
                         posts.retain(|p| p.image_count < 2);
                     }
+                } else if subject == "reply_count" {
+                    let value: u32 = filter["value"].as_i64().unwrap().try_into()?;
+
+                    let operator = if filter.contains_key("operator") {
+                        filter["operator"].as_str().unwrap_or("<")
+                    } else {
+                        "<"
+                    };
+
+                    if operator == "<" {
+                        posts.retain(|p| p.reply_count >= value);
+                    } else if operator == ">" {
+                        posts.retain(|p| p.reply_count <= value);
+                    } else if operator == "==" {
+                        posts.retain(|p| p.reply_count != value);
+                    } else if operator == "!=" {
+                        posts.retain(|p| p.reply_count == value);
+                    }
+                } else if subject == "repost_count" {
+                    let value: u32 = filter["value"].as_i64().unwrap().try_into()?;
+
+                    let operator = if filter.contains_key("operator") {
+                        filter["operator"].as_str().unwrap_or("<")
+                    } else {
+                        "<"
+                    };
+
+                    if operator == "<" {
+                        posts.retain(|p| p.repost_count >= value);
+                    } else if operator == ">" {
+                        posts.retain(|p| p.repost_count <= value);
+                    } else if operator == "==" {
+                        posts.retain(|p| p.repost_count != value);
+                    } else if operator == "!=" {
+                        posts.retain(|p| p.repost_count == value);
+                    }
                 } else if subject == "like_count" {
                     let value: u32 = filter["value"].as_i64().unwrap().try_into()?;
 
@@ -323,6 +383,15 @@ async fn generate_feed_skeleton(
                     } else if operator == "!=" {
                         posts.retain(|p| p.lang == language);
                     }
+                } else if subject == "list" {
+                    let dids_vec = fetch_list(block["listUri"].as_str().unwrap()).await?;
+                    let dids: HashSet<String> = HashSet::from_iter(dids_vec);
+
+                    posts.retain(|p| !dids.contains(&p.author));
+                } else if subject == "duplicates" {
+                    // TODO Make this more efficient
+                    let mut seen: HashSet<String> = HashSet::new();
+                    posts.retain(|p| seen.insert(p.id.clone()));
                 }
             } else if filter_type == "regex" {
                 let value = filter["value"]
@@ -334,6 +403,12 @@ async fn generate_feed_skeleton(
                     filter["caseSensitive"].as_bool().unwrap_or(false)
                 } else {
                     false
+                };
+
+                let target = if filter.contains_key("target") {
+                    filter["target"].as_str().unwrap_or("text")
+                } else {
+                    "text"
                 };
 
                 let regex = if !case_sensitive {
@@ -348,11 +423,54 @@ async fn generate_feed_skeleton(
                 } else {
                     false
                 };
-
-                if invert {
-                    posts.retain(|p| !re.is_match(&p.text));
-                } else {
-                    posts.retain(|p| re.is_match(&p.text));
+                if target == "text" {
+                    if invert {
+                        posts.retain(|p| !re.is_match(&p.text));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.text));
+                    }
+                } else if target == "alt_text" {
+                    if invert {
+                        posts.retain(|p| !re.is_match(&p.alt_text));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.alt_text));
+                    }
+                } else if target == "link" {
+                    if invert {
+                        posts.retain(|p| !re.is_match(&p.link));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.link));
+                    }
+                } else if target == "text|alt_text" {
+                    if invert {
+                        posts.retain(|p| !(re.is_match(&p.text) || re.is_match(&p.alt_text)));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.text) || re.is_match(&p.alt_text));
+                    }
+                } else if target == "alt_text|link" {
+                    if invert {
+                        posts.retain(|p| !(re.is_match(&p.link) || re.is_match(&p.alt_text)));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.link) || re.is_match(&p.alt_text));
+                    }
+                } else if target == "text|link" {
+                    if invert {
+                        posts.retain(|p| !(re.is_match(&p.link) || re.is_match(&p.text)));
+                    } else {
+                        posts.retain(|p| re.is_match(&p.link) || re.is_match(&p.text));
+                    }
+                } else if target == "text|alt_text|link" {
+                    if invert {
+                        posts.retain(|p| {
+                            !(re.is_match(&p.link)
+                                || re.is_match(&p.text)
+                                || re.is_match(&p.alt_text))
+                        });
+                    } else {
+                        posts.retain(|p| {
+                            re.is_match(&p.link) || re.is_match(&p.text) || re.is_match(&p.alt_text)
+                        });
+                    }
                 }
             }
         } else if b_type == "sort" {
@@ -400,6 +518,25 @@ async fn generate_feed_skeleton(
                 // TODO Maybe there's a faster rng
                 posts.shuffle(&mut thread_rng());
             }
+        } else if b_type == "stash" {
+            let action = if block.contains_key("action") {
+                block["action"].as_str().unwrap_or("stash")
+            } else {
+                "stash"
+            };
+            let key = block["key"].as_str().unwrap();
+
+            if action == "stash" {
+                stash.insert(key, posts);
+                posts = vec![];
+            } else if action == "pop" {
+                if !stash.contains_key(key) {
+                    return Err(anyhow!(
+                        "Stash pop failed because stash with that key does not exist"
+                    ));
+                }
+                posts.extend(stash.get(key).unwrap());
+            }
         }
 
         let elapsed = block_start.elapsed();
@@ -409,6 +546,11 @@ async fn generate_feed_skeleton(
             debug
                 .timing
                 .insert(block["id"].as_str().unwrap().to_string(), millis);
+
+            debug.counts.insert(
+                block["id"].as_str().unwrap().to_string(),
+                posts.len() as u128,
+            );
         }
     }
 
@@ -447,9 +589,41 @@ struct PostReference {
 struct FeedBuilderResponseDebug {
     time: u128,
     timing: HashMap<String, u128>,
+    counts: HashMap<String, u128>,
 }
 
-async fn run_query(query: &str, mutex: &RwLock<ServerConfig>) -> Result<(), reqwest::Error> {
+async fn fetch_list(list_uri: &str) -> anyhow::Result<Vec<String>> {
+    let list_id = at_uri_to_post_id(list_uri)?;
+
+    let client = Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("accept", "application/json".parse()?);
+    headers.insert("NS", "atproto".parse()?);
+    headers.insert("DB", "bsky".parse()?);
+    headers.insert("Authorization", get_surreal_auth_header().parse()?);
+
+    let request_builder = client
+        .post(get_surreal_api_url())
+        .headers(headers)
+        .body(LISTITEM_QUERY.replace("LIST_ID", &list_id));
+
+    let res = request_builder.send().await?;
+
+    let list: Vec<Value> = res.json().await?;
+
+    let list2 = list.last().unwrap()["result"].as_array().unwrap();
+
+    Ok(list2
+        .iter()
+        .map(|did| did.as_str().unwrap().to_string())
+        .collect::<Vec<String>>())
+}
+
+async fn run_query(
+    query: &str,
+    mutex: &RwLock<ServerConfig>,
+    timeout: Duration,
+) -> Result<(), reqwest::Error> {
     println!("run_query {}", query);
     let client = Client::new();
     let mut headers = reqwest::header::HeaderMap::new();
@@ -461,7 +635,8 @@ async fn run_query(query: &str, mutex: &RwLock<ServerConfig>) -> Result<(), reqw
     let request_builder = client
         .post(get_surreal_api_url())
         .headers(headers)
-        .body(query.to_string());
+        .body(query.to_string())
+        .timeout(timeout);
 
     let res = request_builder.send().await?;
 
@@ -501,21 +676,59 @@ async fn run_query(query: &str, mutex: &RwLock<ServerConfig>) -> Result<(), reqw
             "en".to_string()
         };
 
-        let new_post = Post::new(
-            id.clone(),
-            post["text"].as_str().unwrap().to_string(),
-            // author.clone(),
-            lang,
-            DateTime::parse_from_rfc3339(post["createdAt"].as_str().unwrap())
+        let image_count: u32;
+
+        let alt_text: String = if post.contains_key("images") && !post["images"].is_null() {
+            let images = post["images"].as_array().unwrap();
+            image_count = images.len() as u32;
+            images
+                .iter()
+                .map(|i| i["alt"].as_str().unwrap())
+                .collect::<Vec<&str>>()
+                .join("|||")
+        } else {
+            image_count = 0;
+            "".to_string()
+        };
+
+        let link: String = if post.contains_key("links") && !post["links"].is_null() {
+            let links = post["links"].as_array().unwrap();
+
+            links
+                .iter()
+                .map(|i| {
+                    i.as_str()
+                        .unwrap()
+                        .strip_prefix("link:⟨")
+                        .unwrap()
+                        .strip_suffix("⟩")
+                        .unwrap()
+                })
+                .collect::<Vec<&str>>()
+                .join("|||")
+        } else {
+            "".to_string()
+        };
+
+        let new_post = Post {
+            id: id.clone(),
+            text: post["text"].as_str().unwrap().to_string(),
+            alt_text: alt_text,
+            link: link,
+            author: author.clone(),
+            lang: lang,
+            created_at: DateTime::parse_from_rfc3339(post["createdAt"].as_str().unwrap())
                 .unwrap()
                 .into(),
-            post["likeCount"].as_i64().unwrap().try_into().unwrap(),
-            post["imageCount"].as_i64().unwrap().try_into().unwrap(),
-            !post["root"].is_null(),
-            !post["root"].is_null()
+            image_count,
+            is_reply: !post["root"].is_null(),
+            is_hellthread: !post["root"].is_null()
                 && post["root"].as_str().unwrap()
                     == "post:plc_wgaezxqi2spqm3mhrb5xvkzi_3juzlwllznd24",
-        );
+            reply_count: post["replyCount"].as_i64().unwrap().try_into().unwrap(),
+            repost_count: post["repostCount"].as_i64().unwrap().try_into().unwrap(),
+            like_count: post["likeCount"].as_i64().unwrap().try_into().unwrap(),
+        };
 
         sc.all_posts.insert(id.clone(), new_post);
 
@@ -531,13 +744,15 @@ async fn run_query(query: &str, mutex: &RwLock<ServerConfig>) -> Result<(), reqw
     Ok(())
 }
 
-static LIKE_COUNT_QUERY: &str = "select likeCount as l,subject as i from like_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
+static REPLY_COUNT_QUERY: &str = "SELECT replyCount as c,subject as i from reply_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
+static REPOST_COUNT_QUERY: &str = "SELECT repostCount as c,subject as i from repost_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
+static LIKE_COUNT_QUERY: &str = "SELECT likeCount as c,subject as i from like_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
 
-async fn run_like_count_query(
+async fn run_update_counts_query(
     duration: &str,
     mutex: &RwLock<ServerConfig>,
 ) -> Result<(), reqwest::Error> {
-    println!("run_like_count_query {}", duration);
+    println!("run_update_counts_query {}", duration);
     let client = Client::new();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("accept", "application/json".parse().unwrap());
@@ -548,23 +763,47 @@ async fn run_like_count_query(
     let request_builder = client
         .post(get_surreal_api_url())
         .headers(headers)
-        .body(LIKE_COUNT_QUERY.replace("VAR_DURATION", duration));
+        .body(
+            vec![REPLY_COUNT_QUERY, REPOST_COUNT_QUERY, LIKE_COUNT_QUERY]
+                .join("\n")
+                .replace("VAR_DURATION", duration),
+        )
+        .timeout(Duration::from_secs(60 * 10));
 
     let res = request_builder.send().await?;
 
     let list: Vec<Value> = res.json().await?;
-    let list2 = list.last().unwrap()["result"].as_array().unwrap();
+
+    let reply_counts = list.get(0).unwrap()["result"].as_array().unwrap();
+    let repost_counts = list.get(1).unwrap()["result"].as_array().unwrap();
+    let like_counts = list.get(2).unwrap()["result"].as_array().unwrap();
 
     let mut sc = mutex.write().await;
 
-    for post in list2 {
+    for post in reply_counts {
         let id = post["i"].as_str().unwrap();
-        let like_count = post["l"].as_i64().unwrap();
+        let reply_count = post["c"].as_i64().unwrap();
+        if sc.all_posts.contains_key(id) {
+            sc.all_posts.get_mut(id).unwrap().reply_count = reply_count.try_into().unwrap();
+        }
+    }
+
+    for post in repost_counts {
+        let id = post["i"].as_str().unwrap();
+        let repost_count = post["c"].as_i64().unwrap();
+        if sc.all_posts.contains_key(id) {
+            sc.all_posts.get_mut(id).unwrap().repost_count = repost_count.try_into().unwrap();
+        }
+    }
+
+    for post in like_counts {
+        let id = post["i"].as_str().unwrap();
+        let like_count = post["c"].as_i64().unwrap();
         if sc.all_posts.contains_key(id) {
             sc.all_posts.get_mut(id).unwrap().like_count = like_count.try_into().unwrap();
         }
     }
-    println!("run_like_count_query done {}", duration);
+    println!("run_update_counts_query done {}", duration);
     Ok(())
 }
 
@@ -642,40 +881,52 @@ fn ensure_valid_rkey(rkey: &str) -> anyhow::Result<()> {
 struct Post {
     id: String,
     text: String,
-    // author: String,
+    alt_text: String,
+    link: String,
+    author: String,
     created_at: DateTime<Utc>,
-    like_count: u32,
     image_count: u32,
     is_reply: bool,
     is_hellthread: bool,
     lang: String,
+
+    reply_count: u32,
+    repost_count: u32,
+    like_count: u32,
     // langs: Vec<String>,
 }
 
 impl Post {
-    fn new(
+    /*  fn new(
         id: String,
         text: String,
-        // author: String,
+        alt_text: String,
+        author: String,
         lang: String,
         created_at: DateTime<Utc>,
-        like_count: u32,
         image_count: u32,
         is_reply: bool,
         is_hellthread: bool,
+
+        reply_count: u32,
+        repost_count: u32,
+        like_count: u32,
     ) -> Post {
         Post {
             id,
             text,
-            // author,
+            alt_text,
+            author,
             lang,
             created_at,
-            like_count,
             image_count,
             is_reply,
             is_hellthread,
+            reply_count,
+            repost_count,
+            like_count,
         }
-    }
+    } */
 
     fn calculate_score(&self, gravity: f64) -> f64 {
         let diff_hours = Utc::now()
