@@ -8,6 +8,7 @@ use axum::{
 };
 use axum_macros::debug_handler;
 use base64::{engine::general_purpose, Engine as _};
+use bumpalo::Bump;
 use chrono::prelude::*;
 use http::Method;
 use rand::{seq::SliceRandom, thread_rng};
@@ -25,9 +26,16 @@ use std::{
 use tokio::{sync::RwLock, task, time};
 use tower_http::cors::{Any, CorsLayer};
 
+// TODO 1 week ago
+static INITIAL_LAST_POST_ID: &str = "post:3k4zmnmgxti";
+
+// TODO 24 hours ago (done!)
+static COUNT_QUERIES_ANCHOR: &str = "post:3k5lzhbvgem";
+
 struct ServerConfig {
     pub all_posts: HashMap<String, Post>,
     pub all_posts_by_author: HashMap<String, HashSet<String>>,
+    pub last_post_id: String,
 }
 
 fn get_surreal_api_url() -> String {
@@ -47,11 +55,15 @@ fn get_surreal_auth_header() -> String {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().unwrap();
-    println!("SurrealDB API URL: {}", env::var("SURREAL_URL_SQL").unwrap());
+    println!(
+        "SurrealDB API URL: {}",
+        env::var("SURREAL_URL_SQL").unwrap()
+    );
 
     let server_config = ServerConfig {
         all_posts: HashMap::new(),
         all_posts_by_author: HashMap::new(),
+        last_post_id: INITIAL_LAST_POST_ID.to_string(),
     };
 
     let arc = Arc::new(RwLock::new(server_config));
@@ -59,48 +71,51 @@ async fn main() {
     println!("init");
 
     // ! 168h = 1 week
-    run_query(
-        "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 168h);", 
-        &arc,
-        Duration::from_secs(60 * 30)
-    ).await.unwrap();
+
+    run_query(&arc, Duration::from_secs(60 * 10)).await.unwrap();
 
     println!("ready!");
 
+    // ! every 60 seconds
     let new_posts_task_arc = Arc::clone(&arc);
     let _new_posts_task = task::spawn(async move {
-        let query = "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 3000s);";
-        let res = run_query(query, &new_posts_task_arc, Duration::from_secs(100)).await;
+        let res = run_query(&new_posts_task_arc, Duration::from_secs(100)).await;
         if res.is_err() {
             println!("ERROR run_query {}", res.unwrap_err());
         }
 
-        let mut interval = time::interval(Duration::from_secs(100));
+        let mut interval = time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let query = "SELECT id,text,author,langs,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM post WHERE createdAt > (time::now() - 300s);";
-            let res = run_query(query, &new_posts_task_arc, Duration::from_secs(100)).await;
+
+            let res = run_query(&new_posts_task_arc, Duration::from_secs(30)).await;
             if res.is_err() {
                 println!("ERROR run_query {}", res.unwrap_err());
             }
         }
     });
 
-    // every 5 mins
+    // ! every 4 minutes
     let like_count_task_arc = Arc::clone(&arc);
     let _like_count_task = task::spawn(async move {
-        time::sleep(Duration::from_secs(30)).await;
+        let res = run_update_counts_query(INITIAL_LAST_POST_ID, &like_count_task_arc).await;
 
-        let mut interval = time::interval(Duration::from_secs(60 * 5));
+        if res.is_err() {
+            println!("ERROR run_update_counts_query {}", res.unwrap_err());
+        }
+
+        let mut interval = time::interval(Duration::from_secs(60 * 4));
         loop {
             interval.tick().await;
-            run_update_counts_query("12h", &like_count_task_arc)
-                .await
-                .unwrap_or(());
+            let res = run_update_counts_query(COUNT_QUERIES_ANCHOR, &like_count_task_arc).await;
+
+            if res.is_err() {
+                println!("ERROR run_update_counts_query {}", res.unwrap_err());
+            }
         }
     });
     // every 60 mins
-    let like_count_task_arc_2 = Arc::clone(&arc);
+    /*     let like_count_task_arc_2 = Arc::clone(&arc);
     let _like_count_task_2 = task::spawn(async move {
         let period = Duration::from_secs(60 * 60);
         time::sleep(period).await;
@@ -112,7 +127,22 @@ async fn main() {
                 .await
                 .unwrap_or(());
         }
-    });
+    }); */
+
+    // every 5 mins
+    // TODO Implement labels
+    /* let labels_task_arc = Arc::clone(&arc);
+    let _labels_task = task::spawn(async move {
+        let period = Duration::from_secs(60 * 5);
+
+        let mut interval = time::interval(period);
+        loop {
+            interval.tick().await;
+            run_update_labels_query(&labels_task_arc)
+                .await
+                .unwrap_or(());
+        }
+    }); */
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
@@ -179,6 +209,24 @@ async fn generate_feed_skeleton(
         .map(|block| block.as_object().unwrap().clone())
         .collect::<Vec<_>>();
 
+    if blocks.len() > 32 {
+        // ! Error Message: Your custom feed has too many blocks! If you are doing a lot of "Single User" inputs, use the "List" input type instead. If you have a lot of RegEx blocks, use only one with pipe|symbols for multiple words. Respond to this message if you need help!
+        return Ok(FeedBuilderResponse {
+            debug: FeedBuilderResponseDebug {
+                time: 0,
+                timing: HashMap::new(),
+                counts: HashMap::new(),
+            },
+            feed: vec![PostReference {
+                post: "at://did:plc:bq2d7fljrtvzvugb2krsnyl6/app.bsky.feed.post/3k5imcxnuay2s"
+                    .to_string(),
+            }],
+        });
+    }
+
+    // TODO Optimization: pre-fetch external feeds here
+
+    let bump = Bump::new();
     let mut posts: Vec<&Post> = vec![];
 
     let mut stash: HashMap<&str, Vec<&Post>> = HashMap::new();
@@ -247,10 +295,11 @@ async fn generate_feed_skeleton(
                 // TODO Configurable or public proxy
                 let request_builder = client
                     .get(format!(
-                        "http://10.0.0.5:4444/xrpc/app.bsky.feed.getFeedSkeleton?feed={}",
+                        "https://feed-proxy.skyfeed.me/xrpc/app.bsky.feed.getFeedSkeleton?feed={}",
                         &feed_uri
                     ))
-                    .headers(headers);
+                    .headers(headers)
+                    .timeout(Duration::from_secs(5));
 
                 let res = request_builder.send().await?;
 
@@ -270,8 +319,44 @@ async fn generate_feed_skeleton(
             } else if input_type == "did" {
                 let did = did_to_key(block["did"].as_str().unwrap(), true)?;
 
-                for id in sc.all_posts_by_author.get(&did).unwrap_or(&HashSet::new()) {
-                    posts.push(sc.all_posts.get(id).unwrap());
+                let collection = if block.contains_key("collection") {
+                    block["collection"].as_str().unwrap_or("post")
+                } else {
+                    "post"
+                };
+
+                if collection.starts_with("post") {
+                    let new_posts = fetch_user_posts(&did, "posts").await?;
+                    for post in new_posts {
+                        posts.push(bump.alloc(post));
+                    }
+                }
+                if collection.contains("reply") {
+                    let new_posts = fetch_user_posts(&did, "replies").await?;
+                    for post in new_posts {
+                        posts.push(bump.alloc(post));
+                    }
+                }
+                if collection.contains("repost") {
+                    let new_posts = fetch_user_posts(&did, "repost").await?;
+                    for post in new_posts {
+                        posts.push(bump.alloc(post));
+                    }
+                }
+                if collection.ends_with("like") {
+                    let new_posts = fetch_user_posts(&did, "like").await?;
+                    for post in new_posts {
+                        posts.push(bump.alloc(post));
+                    }
+                }
+            } else if input_type == "post" {
+                let post_id = at_uri_to_post_id(block["postUri"].as_str().unwrap())?;
+
+                if !sc.all_posts.contains_key(&post_id) {
+                    let post = fetch_post(&post_id).await?;
+                    posts.insert(0, bump.alloc(post));
+                } else {
+                    posts.insert(0, &sc.all_posts.get(&post_id).unwrap());
                 }
             }
         } else if filter_types.contains(&b_type) {
@@ -296,6 +381,10 @@ async fn generate_feed_skeleton(
                         posts.retain(|p| !p.is_hellthread);
                     } else if value == "not_hellthread" {
                         posts.retain(|p| p.is_hellthread);
+                    } else if value == "has_labels" {
+                        posts.retain(|p| !p.has_labels);
+                    } else if value == "has_no_labels" {
+                        posts.retain(|p| p.has_labels);
                     }
                 } else if subject == "image_count" {
                     let value = if filter.contains_key("value") {
@@ -397,7 +486,8 @@ async fn generate_feed_skeleton(
                 let value = filter["value"]
                     .as_str()
                     .unwrap()
-                    .replace(r"\b", r"(?-u:\b)");
+                    .replace(r"\b", r"(?-u:\b)")
+                    .replace(r"\B", r"(?-u:\b)");
 
                 let case_sensitive = if filter.contains_key("caseSensitive") {
                     filter["caseSensitive"].as_bool().unwrap_or(false)
@@ -554,11 +644,15 @@ async fn generate_feed_skeleton(
         }
     }
 
-    if posts.len() > 1024 {
-        posts.drain(1024..posts.len());
+    if posts.len() > 1000 {
+        posts.drain(1000..posts.len());
     }
 
     debug.time = query_start.elapsed().as_millis();
+
+    if debug.time > 4000 {
+        println!("slow query {}ms {:?}", debug.time, blocks);
+    }
 
     let res = FeedBuilderResponse {
         debug,
@@ -605,7 +699,8 @@ async fn fetch_list(list_uri: &str) -> anyhow::Result<Vec<String>> {
     let request_builder = client
         .post(get_surreal_api_url())
         .headers(headers)
-        .body(LISTITEM_QUERY.replace("LIST_ID", &list_id));
+        .body(LISTITEM_QUERY.replace("LIST_ID", &list_id))
+        .timeout(Duration::from_secs(5));
 
     let res = request_builder.send().await?;
 
@@ -619,12 +714,9 @@ async fn fetch_list(list_uri: &str) -> anyhow::Result<Vec<String>> {
         .collect::<Vec<String>>())
 }
 
-async fn run_query(
-    query: &str,
-    mutex: &RwLock<ServerConfig>,
-    timeout: Duration,
-) -> Result<(), reqwest::Error> {
-    println!("run_query {}", query);
+async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow::Result<()> {
+    let last_post_id = { sc_mutex.read().await.last_post_id.clone() };
+    println!("run_query {}", last_post_id);
     let client = Client::new();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("accept", "application/json".parse().unwrap());
@@ -635,124 +727,237 @@ async fn run_query(
     let request_builder = client
         .post(get_surreal_api_url())
         .headers(headers)
-        .body(query.to_string())
+        .body(format!(
+            "SELECT id,text,author,langs,labels,createdAt,images,links,root FROM {}..;",
+            last_post_id,
+        ))
         .timeout(timeout);
+
+    let res = request_builder.send().await?;
+
+    println!("run_query_2 {}", last_post_id);
+
+    let list: Vec<Value> = res.json().await?;
+
+    let list2 = list.last().unwrap()["result"].as_array().unwrap();
+
+    {
+        println!("run_query_2.5 {}", last_post_id);
+        let mut sc = sc_mutex.write().await;
+        println!("run_query_3 {}", last_post_id);
+
+        if list2.len() > 100 {
+            let id = list2.get(list2.len() - 100).unwrap().as_object().unwrap()["id"]
+                .as_str()
+                .unwrap();
+            sc.last_post_id = id.to_string();
+        }
+
+        println!("run_query fetched {} new posts", list2.len());
+
+        for p in list2 {
+            let post = p.as_object().unwrap();
+            let id = post["id"].as_str().unwrap().to_string();
+            if sc.all_posts.contains_key(&id) {
+                continue;
+            }
+            let new_post_res = process_post(post);
+            if new_post_res.is_err() {
+                println!("ERROR could not process post {}", id);
+                continue;
+            }
+            sc.all_posts.insert(id.clone(), new_post_res.unwrap());
+
+            let author = post["author"].as_str().unwrap().to_string();
+            if let Some(author_set) = sc.all_posts_by_author.get_mut(&author) {
+                author_set.insert(id);
+            } else {
+                let mut author_set = HashSet::new();
+                author_set.insert(id);
+                sc.all_posts_by_author.insert(author.clone(), author_set);
+            }
+        }
+
+        println!("run_query done {}", last_post_id);
+        Ok(())
+    }
+}
+
+fn process_post(post: &serde_json::Map<String, Value>) -> anyhow::Result<Post> {
+    let id = post["id"].as_str().unwrap().to_string();
+
+    let author = post["author"].as_str().unwrap().to_string();
+    /*   let langs: Vec<String> = if post.contains_key("langs") && !post["langs"].is_null() {
+        post["langs"]
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect()
+    } else {
+        vec![]
+    }; */
+    let lang: String = if post.contains_key("langs") && !post["langs"].is_null() {
+        let array = post["langs"].as_array().unwrap().first();
+
+        if array.is_none() {
+            "en".to_string()
+        } else {
+            array.unwrap().as_str().unwrap().to_string()
+        }
+    } else {
+        "en".to_string()
+    };
+
+    let image_count: u32;
+
+    let alt_text: String = if post.contains_key("images") && !post["images"].is_null() {
+        let images = post["images"].as_array().unwrap();
+        image_count = images.len() as u32;
+        images
+            .iter()
+            .map(|i| i["alt"].as_str().unwrap())
+            .collect::<Vec<&str>>()
+            .join("|||")
+    } else {
+        image_count = 0;
+        "".to_string()
+    };
+
+    let link: String = if post.contains_key("links") && !post["links"].is_null() {
+        let links = post["links"].as_array().unwrap();
+
+        links
+            .iter()
+            .map(|i| i.as_str().unwrap())
+            .collect::<Vec<&str>>()
+            .join("|||")
+    } else {
+        "".to_string()
+    };
+
+    let new_post = Post {
+        id: id.clone(),
+        text: post["text"].as_str().unwrap().to_string(),
+        alt_text,
+        link,
+        author: author.clone(),
+        lang,
+        created_at: DateTime::parse_from_rfc3339(post["createdAt"].as_str().unwrap())
+            .unwrap_or(DateTime::default())
+            .into(),
+        image_count,
+        is_reply: !post["root"].is_null(),
+        is_hellthread: !post["root"].is_null()
+            && post["root"].as_str().unwrap() == "post:3juzlwllznd24_plc_wgaezxqi2spqm3mhrb5xvkzi",
+        reply_count: if post.contains_key("replyCount") {
+            post["replyCount"].as_i64().unwrap().try_into().unwrap()
+        } else {
+            0
+        },
+        repost_count: if post.contains_key("repostCount") {
+            post["repostCount"].as_i64().unwrap().try_into().unwrap()
+        } else {
+            0
+        },
+        like_count: if post.contains_key("likeCount") {
+            post["likeCount"].as_i64().unwrap().try_into().unwrap()
+        } else {
+            0
+        },
+        has_labels: !post["labels"].is_null(),
+    };
+
+    Ok(new_post)
+}
+
+// static SINGLE_POST_QUERY: &str = "SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM POSTID;";
+
+static SINGLE_POST_QUERY: &str =
+    "SELECT id,text,author,langs,labels,createdAt,images,links,root FROM POSTID;";
+
+async fn fetch_post(id: &str) -> anyhow::Result<Post> {
+    println!("fetch_post {}", id);
+    let client = Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("accept", "application/json".parse().unwrap());
+    headers.insert("NS", "atproto".parse().unwrap());
+    headers.insert("DB", "bsky".parse().unwrap());
+    headers.insert("Authorization", get_surreal_auth_header().parse().unwrap());
+
+    let request_builder = client
+        .post(get_surreal_api_url())
+        .headers(headers)
+        .body(SINGLE_POST_QUERY.replace("POSTID", id))
+        .timeout(Duration::from_secs(3));
 
     let res = request_builder.send().await?;
 
     let list: Vec<Value> = res.json().await?;
     let list2 = list.last().unwrap()["result"].as_array().unwrap();
 
-    let mut sc = mutex.write().await;
-
     for p in list2 {
-        let post = p.as_object().unwrap();
-
-        let id = post["id"].as_str().unwrap().to_string();
-        if sc.all_posts.contains_key(&id) {
-            continue;
-        }
-
-        let author = post["author"].as_str().unwrap().to_string();
-        /*   let langs: Vec<String> = if post.contains_key("langs") && !post["langs"].is_null() {
-            post["langs"]
-                .as_array()
-                .unwrap()
-                .into_iter()
-                .map(|l| l.as_str().unwrap().to_string())
-                .collect()
-        } else {
-            vec![]
-        }; */
-        let lang: String = if post.contains_key("langs") && !post["langs"].is_null() {
-            let array = post["langs"].as_array().unwrap().first();
-
-            if array.is_none() {
-                "en".to_string()
-            } else {
-                array.unwrap().as_str().unwrap().to_string()
-            }
-        } else {
-            "en".to_string()
-        };
-
-        let image_count: u32;
-
-        let alt_text: String = if post.contains_key("images") && !post["images"].is_null() {
-            let images = post["images"].as_array().unwrap();
-            image_count = images.len() as u32;
-            images
-                .iter()
-                .map(|i| i["alt"].as_str().unwrap())
-                .collect::<Vec<&str>>()
-                .join("|||")
-        } else {
-            image_count = 0;
-            "".to_string()
-        };
-
-        let link: String = if post.contains_key("links") && !post["links"].is_null() {
-            let links = post["links"].as_array().unwrap();
-
-            links
-                .iter()
-                .map(|i| {
-                    i.as_str()
-                        .unwrap()
-                        .strip_prefix("link:⟨")
-                        .unwrap()
-                        .strip_suffix("⟩")
-                        .unwrap()
-                })
-                .collect::<Vec<&str>>()
-                .join("|||")
-        } else {
-            "".to_string()
-        };
-
-        let new_post = Post {
-            id: id.clone(),
-            text: post["text"].as_str().unwrap().to_string(),
-            alt_text: alt_text,
-            link: link,
-            author: author.clone(),
-            lang: lang,
-            created_at: DateTime::parse_from_rfc3339(post["createdAt"].as_str().unwrap())
-                .unwrap()
-                .into(),
-            image_count,
-            is_reply: !post["root"].is_null(),
-            is_hellthread: !post["root"].is_null()
-                && post["root"].as_str().unwrap()
-                    == "post:plc_wgaezxqi2spqm3mhrb5xvkzi_3juzlwllznd24",
-            reply_count: post["replyCount"].as_i64().unwrap().try_into().unwrap(),
-            repost_count: post["repostCount"].as_i64().unwrap().try_into().unwrap(),
-            like_count: post["likeCount"].as_i64().unwrap().try_into().unwrap(),
-        };
-
-        sc.all_posts.insert(id.clone(), new_post);
-
-        if let Some(author_set) = sc.all_posts_by_author.get_mut(&author) {
-            author_set.insert(id);
-        } else {
-            let mut author_set = HashSet::new();
-            author_set.insert(id);
-            sc.all_posts_by_author.insert(author.clone(), author_set);
-        }
+        return Ok(process_post(p.as_object().unwrap()).unwrap());
     }
-    println!("run_query done {}", query);
-    Ok(())
+    Err(anyhow!("Could not fetch post {}", id))
 }
 
-static REPLY_COUNT_QUERY: &str = "SELECT replyCount as c,subject as i from reply_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
+// TODO Maybe remove counts
+
+// static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts;";
+// static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts WHERE meta::tb(id) == 'post';";
+
+static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root FROM $posts;";
+static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root FROM $posts WHERE meta::tb(id) == 'post';";
+
+async fn fetch_user_posts(did: &str, collection: &str) -> anyhow::Result<Vec<Post>> {
+    println!("fetch_user_posts {} {}", did, collection);
+    let client = Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("accept", "application/json".parse().unwrap());
+    headers.insert("NS", "atproto".parse().unwrap());
+    headers.insert("DB", "bsky".parse().unwrap());
+    headers.insert("Authorization", get_surreal_auth_header().parse().unwrap());
+
+    let request_builder = client
+        .post(get_surreal_api_url())
+        .headers(headers)
+        .body(if collection == "like" {
+            USER_LIKED_POSTS_QUERY_TEMPLATE.replace("USER_ID", did)
+        } else {
+            USER_POSTS_QUERY_TEMPLATE
+                .replace("USER_ID", did)
+                .replace("COLLECTION_TYPE", collection)
+        })
+        .timeout(Duration::from_secs(20));
+
+    let res = request_builder.send().await?;
+
+    let list: Vec<Value> = res.json().await?;
+    let list2 = list.last().unwrap()["result"].as_array().unwrap();
+
+    let mut posts: Vec<Post> = vec![];
+
+    for p in list2 {
+        posts.push(process_post(p.as_object().unwrap())?);
+    }
+    Ok(posts)
+}
+
+/* static REPLY_COUNT_QUERY: &str = "SELECT replyCount as c,subject as i from reply_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
 static REPOST_COUNT_QUERY: &str = "SELECT repostCount as c,subject as i from repost_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
-static LIKE_COUNT_QUERY: &str = "SELECT likeCount as c,subject as i from like_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);";
+static LIKE_COUNT_QUERY: &str = "SELECT likeCount as c,subject as i from like_count_view WHERE subject.createdAt > (time::now() - VAR_DURATION);"; */
+
+static REPLY_COUNT_QUERY: &str = "SELECT * from reply_count_view:[VAR_ANCHOR]..;";
+static REPOST_COUNT_QUERY: &str = "SELECT * from repost_count_view:[VAR_ANCHOR]..;";
+static LIKE_COUNT_QUERY: &str = "SELECT * from like_count_view:[VAR_ANCHOR]..;";
 
 async fn run_update_counts_query(
-    duration: &str,
-    mutex: &RwLock<ServerConfig>,
-) -> Result<(), reqwest::Error> {
-    println!("run_update_counts_query {}", duration);
+    anchor: &str,
+    sc_mutex: &RwLock<ServerConfig>,
+) -> anyhow::Result<()> {
+    println!("run_update_counts_query");
+
     let client = Client::new();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("accept", "application/json".parse().unwrap());
@@ -766,7 +971,7 @@ async fn run_update_counts_query(
         .body(
             vec![REPLY_COUNT_QUERY, REPOST_COUNT_QUERY, LIKE_COUNT_QUERY]
                 .join("\n")
-                .replace("VAR_DURATION", duration),
+                .replace("VAR_ANCHOR", anchor),
         )
         .timeout(Duration::from_secs(60 * 10));
 
@@ -778,10 +983,10 @@ async fn run_update_counts_query(
     let repost_counts = list.get(1).unwrap()["result"].as_array().unwrap();
     let like_counts = list.get(2).unwrap()["result"].as_array().unwrap();
 
-    let mut sc = mutex.write().await;
+    let mut sc = sc_mutex.write().await;
 
     for post in reply_counts {
-        let id = post["i"].as_str().unwrap();
+        let id = extract_count_id(post);
         let reply_count = post["c"].as_i64().unwrap();
         if sc.all_posts.contains_key(id) {
             sc.all_posts.get_mut(id).unwrap().reply_count = reply_count.try_into().unwrap();
@@ -789,7 +994,7 @@ async fn run_update_counts_query(
     }
 
     for post in repost_counts {
-        let id = post["i"].as_str().unwrap();
+        let id = extract_count_id(post);
         let repost_count = post["c"].as_i64().unwrap();
         if sc.all_posts.contains_key(id) {
             sc.all_posts.get_mut(id).unwrap().repost_count = repost_count.try_into().unwrap();
@@ -797,15 +1002,63 @@ async fn run_update_counts_query(
     }
 
     for post in like_counts {
-        let id = post["i"].as_str().unwrap();
+        let id = extract_count_id(post);
         let like_count = post["c"].as_i64().unwrap();
         if sc.all_posts.contains_key(id) {
             sc.all_posts.get_mut(id).unwrap().like_count = like_count.try_into().unwrap();
+        } else {
+            // TODO println!("MISSING POST {}", id);
         }
     }
-    println!("run_update_counts_query done {}", duration);
+    println!("run_update_counts_query done");
     Ok(())
 }
+
+fn extract_count_id(val: &Value) -> &str {
+    return val["id"]
+        .as_str()
+        .unwrap()
+        .split(":[")
+        .last()
+        .unwrap()
+        .strip_suffix("]")
+        .unwrap();
+}
+
+/* static LABELS_QUERY: &str = "SELECT in FROM post_labels;";
+
+async fn run_update_labels_query(mutex: &RwLock<ServerConfig>) -> anyhow::Result<()> {
+    println!("run_update_labels_query");
+    let client = Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("accept", "application/json".parse().unwrap());
+    headers.insert("NS", "atproto".parse().unwrap());
+    headers.insert("DB", "bsky".parse().unwrap());
+    headers.insert("Authorization", get_surreal_auth_header().parse().unwrap());
+
+    let request_builder = client
+        .post(get_surreal_api_url())
+        .headers(headers)
+        .body(LABELS_QUERY)
+        .timeout(Duration::from_secs(60 * 1));
+
+    let res = request_builder.send().await?;
+    let list: Vec<Value> = res.json().await?;
+    let posts = list.get(0).unwrap()["result"].as_array().unwrap();
+
+    let mut sc = mutex.write().await;
+
+    for post in posts {
+        let id = post["in"].as_str().unwrap();
+
+        if sc.all_posts.contains_key(id) {
+            sc.all_posts.get_mut(id).unwrap().has_labels = true;
+        }
+    }
+
+    println!("run_update_labels_query done");
+    Ok(())
+} */
 
 lazy_static::lazy_static! {
     static ref VALID_DID_KEY_REGEX: Regex = Regex::new(r"^(plc|web)_[a-z0-9_]+$").unwrap();
@@ -818,7 +1071,7 @@ fn convert_post_id_to_uri(id: &str) -> String {
 
     format!(
         "at://did:{}:{}/app.bsky.feed.post/{}",
-        parts[0], parts[1], parts[2]
+        parts[1], parts[2], parts[0]
     )
 }
 
@@ -843,7 +1096,7 @@ fn at_uri_to_post_id(uri: &str) -> anyhow::Result<String> {
     }
     ensure_valid_rkey(&u_rkey).unwrap();
 
-    Ok(format!("{}:{}_{}", collection, did, u_rkey))
+    Ok(format!("{}:{}_{}", collection, u_rkey, did))
 }
 
 fn did_to_key(did: &str, full: bool) -> anyhow::Result<String> {
@@ -893,6 +1146,8 @@ struct Post {
     reply_count: u32,
     repost_count: u32,
     like_count: u32,
+
+    has_labels: bool,
     // langs: Vec<String>,
 }
 
