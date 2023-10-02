@@ -27,14 +27,15 @@ use tokio::{sync::RwLock, task, time};
 use tower_http::cors::{Any, CorsLayer};
 
 // TODO 1 week ago
-static INITIAL_LAST_POST_ID: &str = "post:3k4zmnmgxti";
+static INITIAL_LAST_POST_ID: &str = "post:3k7rrlkoaxg";
 
 // TODO 24 hours ago (done!)
-static COUNT_QUERIES_ANCHOR: &str = "post:3k5lzhbvgem";
+static COUNT_QUERIES_ANCHOR: &str = "post:3kacd4qkqt3";
 
 struct ServerConfig {
     pub all_posts: HashMap<String, Post>,
     pub all_posts_by_author: HashMap<String, HashSet<String>>,
+    pub all_posts_by_tag: HashMap<String, HashSet<String>>,
     pub last_post_id: String,
 }
 
@@ -63,6 +64,7 @@ async fn main() {
     let server_config = ServerConfig {
         all_posts: HashMap::new(),
         all_posts_by_author: HashMap::new(),
+        all_posts_by_tag: HashMap::new(),
         last_post_id: INITIAL_LAST_POST_ID.to_string(),
     };
 
@@ -154,6 +156,10 @@ async fn main() {
             "/xrpc/me.skyfeed.builder.generateFeedSkeleton",
             post(generate_feed_skeleton_route),
         )
+        .route(
+            "/xrpc/app.skyfeed.feed.getTrendingTags",
+            get(get_trending_tags),
+        )
         .layer(cors)
         .with_state(arc);
 
@@ -168,6 +174,20 @@ async fn main() {
 async fn health_check() -> &'static str {
     ""
 }
+async fn get_trending_tags(State(state): State<Arc<RwLock<ServerConfig>>>) -> impl IntoResponse {
+    let mut tags = HashMap::new();
+
+    let sc = state.read().await;
+
+    for tag in sc.all_posts_by_tag.keys() {
+        tags.insert(
+            tag.clone(),
+            sc.all_posts_by_tag.get(tag).unwrap().len() as u128,
+        );
+    }
+
+    (StatusCode::OK, Json(TrendingTagsResponse { tags: tags }))
+}
 
 #[debug_handler]
 async fn generate_feed_skeleton_route(
@@ -178,7 +198,7 @@ async fn generate_feed_skeleton_route(
         .await
         .map_err(|e| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 Json(FeedBuilderResponse {
                     debug: FeedBuilderResponseDebug {
                         time: 0,
@@ -222,6 +242,32 @@ async fn generate_feed_skeleton(
                     .to_string(),
             }],
         });
+    }
+
+    let mut regex_block_count = 0;
+
+    for block in &blocks {
+        let b_type = block["type"].as_str().unwrap();
+
+        if b_type == "regex" {
+            regex_block_count = regex_block_count + 1;
+            if regex_block_count > 6 {
+                // ! Error Message: Your custom feed has too many RegEx blocks! Using a single RegEx block and one additional inverted RegEx block should be enough to achieve the same result. Reply to this message if you need help!
+
+                return Ok(FeedBuilderResponse {
+                    debug: FeedBuilderResponseDebug {
+                        time: 0,
+                        timing: HashMap::new(),
+                        counts: HashMap::new(),
+                    },
+                    feed: vec![PostReference {
+                        post:
+                            "at://did:plc:bq2d7fljrtvzvugb2krsnyl6/app.bsky.feed.post/3k5roduyxlo2e"
+                                .to_string(),
+                    }],
+                });
+            }
+        }
     }
 
     // TODO Optimization: pre-fetch external feeds here
@@ -276,6 +322,30 @@ async fn generate_feed_skeleton(
 
                 for did in dids {
                     for id in sc.all_posts_by_author.get(&did).unwrap_or(&HashSet::new()) {
+                        let post = sc.all_posts.get(id).unwrap();
+                        if post.created_at > cutoff {
+                            posts.push(post);
+                        }
+                    }
+                }
+            } else if input_type == "tags" {
+                let array = block["tags"].as_array().unwrap();
+
+                // ---
+
+                let seconds = if block.contains_key("historySeconds") {
+                    block["historySeconds"].as_i64().unwrap_or(604800)
+                } else {
+                    604800
+                };
+
+                let cutoff = Utc::now()
+                    .checked_sub_signed(chrono::Duration::seconds(seconds))
+                    .unwrap();
+
+                for tag_value in array {
+                    let tag = tag_value.as_str().unwrap().to_string();
+                    for id in sc.all_posts_by_tag.get(&tag).unwrap_or(&HashSet::new()) {
                         let post = sc.all_posts.get(id).unwrap();
                         if post.created_at > cutoff {
                             posts.push(post);
@@ -513,6 +583,7 @@ async fn generate_feed_skeleton(
                 } else {
                     false
                 };
+                // TODO test performance with 10k posts (text), if above 500ms CANCEL
                 if target == "text" {
                     if invert {
                         posts.retain(|p| !re.is_match(&p.text));
@@ -669,6 +740,11 @@ async fn generate_feed_skeleton(
 }
 
 #[derive(Serialize)]
+struct TrendingTagsResponse {
+    tags: HashMap<String, u128>,
+}
+
+#[derive(Serialize)]
 struct FeedBuilderResponse {
     debug: FeedBuilderResponseDebug,
     feed: Vec<PostReference>,
@@ -728,7 +804,7 @@ async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow
         .post(get_surreal_api_url())
         .headers(headers)
         .body(format!(
-            "SELECT id,text,author,langs,labels,createdAt,images,links,root FROM {}..;",
+            "SELECT id,text,author,langs,tags,labels,createdAt,images,links,root FROM {}..;",
             last_post_id,
         ))
         .timeout(timeout);
@@ -767,6 +843,22 @@ async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow
                 continue;
             }
             sc.all_posts.insert(id.clone(), new_post_res.unwrap());
+
+            if post.contains_key("tags") && !post["tags"].is_null() {
+                let array = post["tags"].as_array().unwrap();
+
+                for tag_value in array {
+                    let tag = tag_value.as_str().unwrap().to_string();
+
+                    if let Some(tag_set) = sc.all_posts_by_tag.get_mut(&tag) {
+                        tag_set.insert(id.clone());
+                    } else {
+                        let mut tag_set = HashSet::new();
+                        tag_set.insert(id.clone());
+                        sc.all_posts_by_tag.insert(tag.clone(), tag_set);
+                    }
+                }
+            }
 
             let author = post["author"].as_str().unwrap().to_string();
             if let Some(author_set) = sc.all_posts_by_author.get_mut(&author) {
@@ -871,10 +963,10 @@ fn process_post(post: &serde_json::Map<String, Value>) -> anyhow::Result<Post> {
     Ok(new_post)
 }
 
-// static SINGLE_POST_QUERY: &str = "SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM POSTID;";
+// static SINGLE_POST_QUERY: &str = "SELECT id,text,author,langs,tags,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM POSTID;";
 
 static SINGLE_POST_QUERY: &str =
-    "SELECT id,text,author,langs,labels,createdAt,images,links,root FROM POSTID;";
+    "SELECT id,text,author,langs,tags,labels,createdAt,images,links,root FROM POSTID;";
 
 async fn fetch_post(id: &str) -> anyhow::Result<Post> {
     println!("fetch_post {}", id);
@@ -904,11 +996,11 @@ async fn fetch_post(id: &str) -> anyhow::Result<Post> {
 
 // TODO Maybe remove counts
 
-// static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts;";
-// static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts WHERE meta::tb(id) == 'post';";
+// static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts;";
+// static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts WHERE meta::tb(id) == 'post';";
 
-static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root FROM $posts;";
-static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,labels,createdAt,images,links,root FROM $posts WHERE meta::tb(id) == 'post';";
+static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,labels,createdAt,images,links,root FROM $posts;";
+static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,labels,createdAt,images,links,root FROM $posts WHERE meta::tb(id) == 'post';";
 
 async fn fetch_user_posts(did: &str, collection: &str) -> anyhow::Result<Vec<Post>> {
     println!("fetch_user_posts {} {}", did, collection);
