@@ -1067,7 +1067,6 @@ dependencies = [
  "axum",
  "axum-macros",
  "base64",
- "bumpalo",
  "chrono",
  "dotenvy",
  "http",
