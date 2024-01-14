@@ -10,6 +10,7 @@ use axum_macros::debug_handler;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::prelude::*;
 use http::Method;
+use mimalloc::MiMalloc;
 use rand::{seq::SliceRandom, thread_rng};
 use regex::Regex;
 use reqwest::Client;
@@ -24,6 +25,9 @@ use std::{
 };
 use tokio::{sync::RwLock, task, time};
 use tower_http::cors::{Any, CorsLayer};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 // TODO 1 week ago
 static INITIAL_LAST_POST_ID: &str = "post:3kc7ycvgkmo2c";
