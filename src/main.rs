@@ -14,15 +14,16 @@ use mimalloc::MiMalloc;
 use rand::{seq::SliceRandom, thread_rng};
 use regex::Regex;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::net::SocketAddr;
+use std::io::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     env,
     sync::Arc,
     time::{Duration, Instant},
 };
+use std::{net::SocketAddr, path::PathBuf};
 use tokio::{sync::RwLock, task, time};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -30,15 +31,16 @@ use tower_http::cors::{Any, CorsLayer};
 static GLOBAL: MiMalloc = MiMalloc;
 
 // TODO 1 week ago
-static INITIAL_LAST_POST_ID: &str = "post:3kc7ycvgkmo2c";
+static TMP_INITIAL_LAST_POST_ID: &str = "post:3kkyt5v2h";
 
 // TODO 24 hours ago (done!)
-static COUNT_QUERIES_ANCHOR: &str = "post:3kcr2552ijg25";
+static TMP_COUNT_QUERIES_ANCHOR: &str = "post:3klhwaxeu";
 
 static HEADER_NAMESPACE: &str = "bsky";
 // static HEADER_NAMESPACE: &str = "atproto";
 
-struct ServerConfig {
+#[derive(Clone)]
+struct ServerConfigInstance {
     pub all_posts: HashMap<String, Post>,
     pub all_posts_by_author: HashMap<String, HashSet<String>>,
     pub all_posts_by_tag: HashMap<String, HashSet<String>>,
@@ -46,6 +48,14 @@ struct ServerConfig {
     pub tag_variations: HashMap<String, HashMap<String, u128>>,
 
     pub all_profiles: HashMap<String, Profile>,
+}
+
+struct ServerConfigWrapper {
+    pub instance_a: RwLock<ServerConfigInstance>,
+    pub instance_b: RwLock<ServerConfigInstance>,
+    pub pointer_is_a: RwLock<bool>,
+
+    pub count_queries_anchor: RwLock<String>,
 }
 
 fn get_surreal_api_url() -> String {
@@ -58,7 +68,7 @@ fn get_surreal_auth_header() -> String {
 
     format!(
         "Basic {}",
-        general_purpose::URL_SAFE_NO_PAD.encode(format!("{}:{}", user, pass))
+        general_purpose::URL_SAFE.encode(format!("{}:{}", user, pass))
     )
 }
 
@@ -72,16 +82,25 @@ async fn main() {
 
     let is_running_in_feed_mode = env::var("MODE").is_err();
 
-    let server_config = ServerConfig {
+    let server_config_instance = ServerConfigInstance {
         all_posts: HashMap::new(),
         all_posts_by_author: HashMap::new(),
         all_posts_by_tag: HashMap::new(),
-        last_post_id: INITIAL_LAST_POST_ID.to_string(),
+        last_post_id: TMP_INITIAL_LAST_POST_ID.to_string(),
         tag_variations: HashMap::new(),
         all_profiles: HashMap::new(),
     };
 
-    let arc = Arc::new(RwLock::new(server_config));
+    let server_config_wrapper = ServerConfigWrapper {
+        instance_a: RwLock::new(server_config_instance.clone()),
+        instance_b: RwLock::new(server_config_instance),
+        pointer_is_a: RwLock::new(true),
+        count_queries_anchor: RwLock::new(TMP_COUNT_QUERIES_ANCHOR.to_string()),
+    };
+
+    let root_arc = Arc::new(server_config_wrapper);
+
+    let arc = Arc::clone(&root_arc);
 
     println!("init");
 
@@ -89,49 +108,76 @@ async fn main() {
 
     if is_running_in_feed_mode {
         println!("running in feed mode");
+        {
+            run_query(&arc.instance_a, Duration::from_secs(60 * 15))
+                .await
+                .unwrap();
 
-        run_query(&arc, Duration::from_secs(60 * 10)).await.unwrap();
+            let res = run_update_counts_query(TMP_INITIAL_LAST_POST_ID, &arc.instance_a).await;
+            if res.is_err() {
+                println!("ERROR run_update_counts_query {}", res.unwrap_err());
+            }
+
+            println!("cloning state");
+            {
+                let read = arc.instance_a.read().await;
+                *arc.instance_b.write().await = read.clone();
+            }
+        }
 
         println!("ready!");
 
-        // ! every 60 seconds
+        // ! every 100 seconds
         let new_posts_task_arc = Arc::clone(&arc);
         let _new_posts_task = task::spawn(async move {
-            /* let res = run_query(&new_posts_task_arc, Duration::from_secs(100)).await;
-            if res.is_err() {
-                println!("ERROR run_query {}", res.unwrap_err());
-            } */
-
-            let mut interval = time::interval(Duration::from_secs(60));
+            let mut interval = time::interval(Duration::from_secs(100));
+            let mut counter = 0;
             loop {
                 interval.tick().await;
+                println!("fetching new posts...");
+                let new_pointer_is_a = { !*new_posts_task_arc.pointer_is_a.read().await };
 
-                let res = run_query(&new_posts_task_arc, Duration::from_secs(30)).await;
-                if res.is_err() {
-                    println!("ERROR run_query {}", res.unwrap_err());
+                {
+                    let res = run_query(
+                        {
+                            if new_pointer_is_a {
+                                &new_posts_task_arc.instance_a
+                            } else {
+                                &new_posts_task_arc.instance_b
+                            }
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await;
+
+                    if res.is_err() {
+                        println!("ERROR run_query {}", res.unwrap_err());
+                    }
+                    counter += 1;
+                    if counter % 5 == 0 {
+                        println!("fetching new counts...");
+                        let count_queries_anchor =
+                            { arc.count_queries_anchor.read().await.clone() };
+                        let res = run_update_counts_query(&count_queries_anchor, {
+                            if new_pointer_is_a {
+                                &new_posts_task_arc.instance_a
+                            } else {
+                                &new_posts_task_arc.instance_b
+                            }
+                        })
+                        .await;
+
+                        if res.is_err() {
+                            println!("ERROR run_update_counts_query {}", res.unwrap_err());
+                        }
+                    }
                 }
+                *new_posts_task_arc.pointer_is_a.write().await = new_pointer_is_a;
+
+                println!("finished update loop");
             }
         });
 
-        // ! every 5 minutes
-        let like_count_task_arc = Arc::clone(&arc);
-        let _like_count_task = task::spawn(async move {
-            /*   let res = run_update_counts_query(INITIAL_LAST_POST_ID, &like_count_task_arc).await;
-
-            if res.is_err() {
-                println!("ERROR run_update_counts_query {}", res.unwrap_err());
-            } */
-
-            let mut interval = time::interval(Duration::from_secs(60 * 5));
-            loop {
-                interval.tick().await;
-                let res = run_update_counts_query(COUNT_QUERIES_ANCHOR, &like_count_task_arc).await;
-
-                if res.is_err() {
-                    println!("ERROR run_update_counts_query {}", res.unwrap_err());
-                }
-            }
-        });
 
         /*     let cleanup_task_arc = Arc::clone(&arc);
         let _cleanup_task = task::spawn(async move {
@@ -229,7 +275,10 @@ async fn main() {
         .layer(cors)
         .with_state(arc);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4444));
+    let addr = SocketAddr::from((
+        [0, 0, 0, 0],
+        if is_running_in_feed_mode { 4444 } else { 4445 },
+    ));
     // tracing::debug!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -240,9 +289,10 @@ async fn main() {
 async fn health_check() -> &'static str {
     ""
 }
+
 async fn get_trending_tags(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<Arc<RwLock<ServerConfig>>>,
+    State(state): State<Arc<ServerConfigWrapper>>,
 ) -> impl IntoResponse {
     let minutes = if params.contains_key("minutes") {
         params.get("minutes").unwrap().parse::<i64>().unwrap()
@@ -256,7 +306,14 @@ async fn get_trending_tags(
 
     let mut tags = vec![];
 
-    let sc = state.read().await;
+    let sc = {
+        if *state.pointer_is_a.read().await {
+            state.instance_a.read()
+        } else {
+            state.instance_b.read()
+        }
+    }
+    .await;
 
     // sc.tag_variations
 
@@ -304,7 +361,7 @@ async fn get_trending_tags(
 
 #[debug_handler]
 async fn generate_feed_skeleton_route(
-    State(state): State<Arc<RwLock<ServerConfig>>>,
+    State(state): State<Arc<ServerConfigWrapper>>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     let res = tokio::time::timeout(
@@ -339,7 +396,7 @@ async fn generate_feed_skeleton_route(
                         counts: HashMap::new(),
                     },
                     feed: vec![PostReference {
-                        post: format!("Error: {}", e,),
+                        post: format!("Error: {}", e),
                     }],
                 }),
             )
@@ -351,7 +408,7 @@ async fn generate_feed_skeleton_route(
 
 #[debug_handler]
 async fn generate_list_skeleton_route(
-    State(state): State<Arc<RwLock<ServerConfig>>>,
+    State(state): State<Arc<ServerConfigWrapper>>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     let res = tokio::time::timeout(
@@ -398,10 +455,11 @@ async fn generate_list_skeleton_route(
     response.unwrap_or_else(|(status, body)| (status, body))
 }
 
-static LISTITEM_QUERY: &str = "RETURN (SELECT ->listitem.out as dids FROM LIST_ID).dids;";
+static LISTITEM_QUERY: &str =
+    "RETURN array::flatten((SELECT ->listitem.out as dids FROM LIST_ID).dids);";
 
 async fn generate_feed_skeleton(
-    state: Arc<RwLock<ServerConfig>>,
+    state: Arc<ServerConfigWrapper>,
     payload: Value,
 ) -> anyhow::Result<FeedBuilderResponse> {
     let blocks = payload["blocks"]
@@ -535,8 +593,14 @@ async fn generate_feed_skeleton(
         timing: HashMap::new(),
         counts: HashMap::new(),
     };
-
-    let sc = state.read().await;
+    let sc = {
+        if *state.pointer_is_a.read().await {
+            state.instance_a.read()
+        } else {
+            state.instance_b.read()
+        }
+    }
+    .await;
 
     let query_start = Instant::now();
 
@@ -1050,22 +1114,64 @@ async fn generate_feed_skeleton(
             if posts.len() > count {
                 posts.drain((count)..);
             }
-        } /* else if b_type == "replace" {
-              let target = if block.contains_key("target") {
-                  block["target"].as_str().unwrap_or("parent")
-              } else {
-                  "parent"
-              };
+        } else if b_type == "replace" {
+            let target = if block.contains_key("with") {
+                block["with"].as_str().unwrap_or("parent")
+            } else {
+                "parent"
+            };
+            let keep_unsuitable_posts = if block.contains_key("keepItemsWithMissingTarget") {
+                block["keepItemsWithMissingTarget"]
+                    .as_bool()
+                    .unwrap_or(true)
+            } else {
+                true
+            };
 
-              let mut new_posts: Vec<&Post> = vec![];
+            let mut new_posts: Vec<&Post> = vec![];
 
-              if target == "parent" {
-                  for post in posts {
-                      let new_post = post.is_reply
-                  }
-              }
-              posts = new_posts;
-          } */
+            if target == "parent" {
+                for post in posts {
+                    if post.parent.is_empty() {
+                        if keep_unsuitable_posts {
+                            new_posts.push(post);
+                        }
+                    } else {
+                        let replacement = sc.all_posts.get(&post.parent);
+                        if replacement.is_some() {
+                            new_posts.push(replacement.unwrap());
+                        }
+                    }
+                }
+            } else if target == "root" {
+                for post in posts {
+                    if post.root.is_empty() {
+                        if keep_unsuitable_posts {
+                            new_posts.push(post);
+                        }
+                    } else {
+                        let replacement = sc.all_posts.get(&post.root);
+                        if replacement.is_some() {
+                            new_posts.push(replacement.unwrap());
+                        }
+                    }
+                }
+            } else if target == "record" {
+                for post in posts {
+                    if post.record.is_empty() {
+                        if keep_unsuitable_posts {
+                            new_posts.push(post);
+                        }
+                    } else {
+                        let replacement = sc.all_posts.get(&post.record);
+                        if replacement.is_some() {
+                            new_posts.push(replacement.unwrap());
+                        }
+                    }
+                }
+            }
+            posts = new_posts;
+        }
 
         let elapsed = block_start.elapsed();
         let millis = elapsed.as_millis();
@@ -1108,7 +1214,7 @@ async fn generate_feed_skeleton(
 }
 
 async fn generate_list_skeleton(
-    state: Arc<RwLock<ServerConfig>>,
+    state: Arc<ServerConfigWrapper>,
     payload: Value,
 ) -> anyhow::Result<ListBuilderResponse> {
     let blocks = payload["blocks"]
@@ -1145,8 +1251,14 @@ async fn generate_list_skeleton(
         timing: HashMap::new(),
         counts: HashMap::new(),
     };
-
-    let sc = state.read().await;
+    let sc = {
+        if *state.pointer_is_a.read().await {
+            state.instance_a.read()
+        } else {
+            state.instance_b.read()
+        }
+    }
+    .await;
 
     let query_start = Instant::now();
 
@@ -1459,6 +1571,8 @@ struct ListSubject {
 
 static FOLLOWING_QUERY: &str =
     "RETURN array::flatten((SELECT ->follow.out AS dids FROM USER_DID).dids);";
+static FOLLOWING_FOLLOWING_QUERY: &str =
+    "RETURN array::flatten((SELECT ->follow.out->follow.out AS dids FROM USER_DID).dids);";
 static FOLLOWERS_QUERY: &str =
     "RETURN array::flatten((SELECT <-follow.in AS dids FROM USER_DID).dids);";
 static MUTUALS_QUERY: &str = "RETURN array::intersect(array::flatten((SELECT ->follow.out AS dids FROM USER_DID).dids), array::flatten((SELECT <-follow.in AS dids FROM USER_DID).dids));";
@@ -1473,6 +1587,8 @@ async fn fetch_list(list_uri: &str) -> anyhow::Result<Vec<String>> {
 
         if u_type == "following" {
             Ok(FOLLOWING_QUERY.replace("USER_DID", &did))
+        } else if u_type == "following_following" {
+            Ok(FOLLOWING_FOLLOWING_QUERY.replace("USER_DID", &did))
         } else if u_type == "mutuals" {
             Ok(MUTUALS_QUERY.replace("USER_DID", &did))
         } else if u_type == "followers" {
@@ -1512,7 +1628,10 @@ async fn fetch_list(list_uri: &str) -> anyhow::Result<Vec<String>> {
         .collect::<Vec<String>>())
 }
 
-async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow::Result<()> {
+async fn run_query(
+    sc_mutex: &RwLock<ServerConfigInstance>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let last_post_id = { sc_mutex.read().await.last_post_id.clone() };
     println!("run_query {}", last_post_id);
     let client = Client::new();
@@ -1526,7 +1645,7 @@ async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow
         .post(get_surreal_api_url())
         .headers(headers)
         .body(format!(
-            "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root FROM {}..;",
+            "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent FROM {}..;",
             last_post_id,
         ))
         .timeout(timeout);
@@ -1618,7 +1737,7 @@ async fn run_query(sc_mutex: &RwLock<ServerConfig>, timeout: Duration) -> anyhow
 }
 
 async fn run_profiles_query(
-    sc_mutex: &RwLock<ServerConfig>,
+    sc_mutex: &RwLock<ServerConfigInstance>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     println!("run_profiles_query");
@@ -1667,7 +1786,11 @@ async fn run_profiles_query(
 }
 
 fn process_post(post: &serde_json::Map<String, Value>) -> anyhow::Result<Post> {
-    let id = post["id"].as_str().unwrap().to_string();
+    let id_res = post["id"].as_str();
+    if id_res.is_none() {
+        return Err(anyhow!("Failed to process_post"));
+    }
+    let id = id_res.unwrap().to_string();
 
     let author = post["author"].as_str().unwrap().to_string();
     /*   let langs: Vec<String> = if post.contains_key("langs") && !post["langs"].is_null() {
@@ -1723,6 +1846,16 @@ fn process_post(post: &serde_json::Map<String, Value>) -> anyhow::Result<Post> {
     } else {
         "".to_string()
     };
+    let root: String = if post.contains_key("root") && !post["root"].is_null() {
+        post["root"].as_str().unwrap().to_string()
+    } else {
+        "".to_string()
+    };
+    let parent: String = if post.contains_key("parent") && !post["parent"].is_null() {
+        post["parent"].as_str().unwrap().to_string()
+    } else {
+        "".to_string()
+    };
 
     let new_post = Post {
         id: id.clone(),
@@ -1755,6 +1888,8 @@ fn process_post(post: &serde_json::Map<String, Value>) -> anyhow::Result<Post> {
             0
         },
         has_labels: !post["labels"].is_null(),
+        root,
+        parent,
     };
 
     Ok(new_post)
@@ -1794,10 +1929,10 @@ fn process_profile(profile: &serde_json::Map<String, Value>) -> anyhow::Result<P
     Ok(new_profile)
 }
 
-// static SINGLE_POST_QUERY: &str = "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM POSTID;";
+// static SINGLE_POST_QUERY: &str = "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM POSTID;";
 
 static SINGLE_POST_QUERY: &str =
-    "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root FROM POSTID;";
+    "SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent FROM POSTID;";
 
 async fn fetch_post(id: &str) -> anyhow::Result<Post> {
     println!("fetch_post {}", id);
@@ -1827,12 +1962,12 @@ async fn fetch_post(id: &str) -> anyhow::Result<Post> {
 
 // TODO Maybe remove counts
 
-// static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts;";
-// static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts WHERE meta::tb(id) == 'post';";
+// static USER_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts;";
+// static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent,count(<-like) as likeCount,count(<-repost) as repostCount,count(<-replyto) as replyCount FROM $posts WHERE meta::tb(id) == 'post';";
 
-static USER_POSTS_QUERY_TEMPLATE_NO_COUNTS: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root FROM $posts;";
-static USER_POSTS_QUERY_TEMPLATE_WITH_COUNTS: &str ="LET $posts = (SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,array::first((SELECT c FROM type::thing('like_count_view', [$parent.id])).c) as likeCount,array::first((SELECT c FROM type::thing('reply_count_view', [$parent.id])).c) as replyCount,array::first((SELECT c FROM type::thing('repost_count_view', [$parent.id])).c) as repostCount FROM $posts;";
-static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = (SELECT ->like.out as ids FROM USER_ID).ids; SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root FROM $posts WHERE meta::tb(id) == 'post';";
+static USER_POSTS_QUERY_TEMPLATE_NO_COUNTS: &str ="LET $posts = array::flatten((SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids); SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent FROM $posts;";
+static USER_POSTS_QUERY_TEMPLATE_WITH_COUNTS: &str ="LET $posts = array::flatten((SELECT ->COLLECTION_TYPE.out as ids FROM USER_ID).ids); SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent,array::first((SELECT c FROM type::thing('like_count_view', [$parent.id])).c) as likeCount,array::first((SELECT c FROM type::thing('reply_count_view', [$parent.id])).c) as replyCount,array::first((SELECT c FROM type::thing('repost_count_view', [$parent.id])).c) as repostCount FROM $posts;";
+static USER_LIKED_POSTS_QUERY_TEMPLATE: &str ="LET $posts = array::flatten((SELECT ->like.out as ids FROM USER_ID).ids); SELECT id,text,author,langs,tags,record,labels,createdAt,images,links,root,parent FROM $posts WHERE meta::tb(id) == 'post';";
 
 async fn fetch_user_posts(
     did: &str,
@@ -1888,7 +2023,7 @@ static LIKE_COUNT_QUERY: &str = "SELECT * from like_count_view:[VAR_ANCHOR]..;";
 
 async fn run_update_counts_query(
     anchor: &str,
-    sc_mutex: &RwLock<ServerConfig>,
+    sc_mutex: &RwLock<ServerConfigInstance>,
 ) -> anyhow::Result<()> {
     println!("run_update_counts_query");
 
@@ -2120,6 +2255,7 @@ fn ensure_valid_rkey(rkey: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 struct Post {
     id: String,
     text: String,
@@ -2133,6 +2269,9 @@ struct Post {
     is_hellthread: bool,
     lang: String,
 
+    parent: String,
+    root: String,
+
     reply_count: u32,
     repost_count: u32,
     like_count: u32,
@@ -2141,6 +2280,7 @@ struct Post {
     // langs: Vec<String>,
 }
 
+#[derive(Clone)]
 struct Profile {
     id: String,
     name: String,
