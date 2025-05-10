@@ -10,18 +10,29 @@ anyhow = "1.0.71"
 axum = "0.6.18"
 axum-macros = "0.3.7"
 base64 = "0.21.2"
-blake3 = "1.5.0"
-chrono = { version = "0.4.26", features = ["serde"] }
+blake3 = "1.5.4"
+chrono = { version = "0.4.26" }
 dotenvy = "0.15.7"
 http = "0.2.9"
 lazy_static = "1.4.0"
-mimalloc = { version = "0.1.39", default-features = false }
+mimalloc = { version = "0.1.43", default-features = false }
 rand = "0.8.5"
-regex = "1.8.4"
+regex = "1.10.6"
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0.164", features = ["derive"] }
 serde_json = "1.0.99"
-tokio = { version = "1.29.0", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }
 tower-http = { version = "0.4.1", features = ["cors"] }
-tracing = "0.1.37"
-tracing-subscriber = "0.3.17"
+rkyv = { version = "0.8.7" }
+memmap2 = "0.9.5"
+arc-swap = "1.7.0"
+data-encoding = "2.5.0"
+simd-json = { version = "0.13.10", features = [
+    "serde_impl",
+     "runtime-detection",
+] }
+rhai = "1.19.0"
+elsa = "1.10.0"
+roaring = "0.10.10"
+boxcar = "0.2.8"
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
